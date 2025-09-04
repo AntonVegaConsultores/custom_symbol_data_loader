@@ -42,9 +42,10 @@ class ImportedQuoteFillModel(FillModel):
     bid/ask. If missing falls back to Security.price for market orders and no
     fill for limits.
     """
-    def __init__(self, algorithm):
+    def __init__(self, algorithm, symbol):
         super().__init__()
         self.algorithm = algorithm
+        self.symbol = symbol
 
     def _get_last_import_quote(self) -> Optional[QuoteBar]:
         """Return last imported QuoteBar if algorithm stored it.
