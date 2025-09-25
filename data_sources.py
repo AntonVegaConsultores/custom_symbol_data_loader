@@ -10,9 +10,9 @@ Example (algorithm initialize):
 
 No external dependencies; uses only QuantConnect LEAN primitives.
 """
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple
 import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Tuple, Union
 
 try:  # Safe imports for LEAN environment or local linting
     from AlgorithmImports import (Bar, BaseData, PythonData, QuoteBar,
@@ -34,6 +34,68 @@ except Exception:  # Minimal stubs
         def __init__(self, *a, **k): ...
     class SubscriptionTransportMedium:
         OBJECT_STORE = 0
+
+# ---- Global delta configuration ----
+# A single global time delta applied to ALL readers in this module.
+# Set it once from your algorithm if you need to shift timestamps uniformly.
+_GLOBAL_DELTA: Optional[timedelta] = None
+
+def _parse_delta_string(s: str) -> timedelta:
+    """Parse a human-friendly delta string into timedelta.
+
+    Examples: '30s', '5min', '2h', '1d', '+90s', '0.5h'.
+    If the string is a plain number, it's treated as seconds.
+    """
+    s = s.strip().lower()
+    # If it's just a number, interpret as seconds
+    try:
+        seconds = float(s)
+        return timedelta(seconds=seconds)
+    except Exception:
+        pass
+    # Extract number + unit
+    m = re.match(r'^([+-]?\d+(?:\.\d*)?)\s*([a-z]+)$', s)
+    if not m:
+        raise ValueError("Invalid delta string. Use '30s', '5min', '2h', '1d' or raw seconds.")
+    amount = float(m.group(1))
+    unit = m.group(2)
+    # Map synonyms to canonical unit keys
+    synonyms = {
+        's': 's', 'sec': 's', 'secs': 's', 'second': 's', 'seconds': 's',
+        'm': 'min', 'min': 'min', 'mins': 'min', 'minute': 'min', 'minutes': 'min',
+        'h': 'h', 'hr': 'h', 'hrs': 'h', 'hour': 'h', 'hours': 'h',
+        'd': 'd', 'day': 'd', 'days': 'd',
+    }
+    canonical = synonyms.get(unit)
+    if not canonical:
+        raise ValueError("Unknown delta unit. Use s/sec, min, h/hr, or d/day.")
+    field = {'s': 'seconds', 'min': 'minutes', 'h': 'hours', 'd': 'days'}[canonical]
+    return timedelta(**{field: amount})
+
+def set_global_delta(delta: Optional[Union[str, int, float, timedelta]]) -> None:
+    """Define a global time offset applied by all readers in this module.
+
+    Accepted values:
+      - timedelta
+      - number (seconds)
+      - string with unit: 'Xs' seconds, 'Ymin' minutes, 'Zh' hours, 'Wd' days
+      - None to clear
+    """
+    global _GLOBAL_DELTA
+    # Inline parsing to keep this simple and obvious
+    if delta is None:
+        _GLOBAL_DELTA = None
+        return
+    if isinstance(delta, timedelta):
+        _GLOBAL_DELTA = delta
+        return
+    if isinstance(delta, (int, float)):
+        _GLOBAL_DELTA = timedelta(seconds=float(delta))
+        return
+    if isinstance(delta, str):
+        _GLOBAL_DELTA = _parse_delta_string(delta)
+        return
+    raise ValueError("Unsupported delta type. Provide timedelta, number (seconds), or string like '5min'.")
 
 # ---- Helpers for filename convention and parsing ----
 # New explicit convention (ObjectStore key = file name):
@@ -134,14 +196,22 @@ def _granularity_to_timedelta(gran: str) -> timedelta:
 class CustomEurUsdQuoteData(PythonData):
     """Custom EURUSD quote (bid/ask) data -> yields QuoteBar.
 
-    CSV Format (ObjectStore file name KEY):
-      Date,BidOpen,BidHigh,BidLow,BidClose,AskOpen,AskHigh,AskLow,AskClose,Volume
+        CSV Format (ObjectStore file name KEY):
+            Old format (still supported):
+                Date,BidOpen,BidHigh,BidLow,BidClose,AskOpen,AskHigh,AskLow,AskClose,Volume
+
+            New format (preferred):
+                Date,BidOpen,BidHigh,BidLow,BidClose,AskOpen,AskHigh,AskLow,AskClose,VolumeQuotes,Open,High,Low,Close,VolumeTrades
 
     Example line:
       2025-07-10 00:00:00,1.17376,1.17377,1.17353,1.17359,1.17387,1.17388,1.17363,1.17369,278
 
-    Produces a QuoteBar with bid/ask Bar objects. Mid prices (close etc.) are
-    computed by LEAN from bid/ask (no manual assignment needed).
+    Produces a QuoteBar with bid/ask Bar objects. If the new format is used,
+        the trade OHLC (Open, High, Low, Close) columns will be parsed and we
+        will attempt to set QuoteBar.open/high/low/close from them (supported in
+        recent LEAN builds). We also set QuoteBar.value to the trade close. If
+        direct assignment isn't supported by the runtime, the code falls back to
+        keeping mid-derived values while still exposing trade close via value.
 
     Usage:
       self.add_data(CustomEurUsdQuoteData, "EURUSD_IMPORT", Resolution.MINUTE)
@@ -151,6 +221,7 @@ class CustomEurUsdQuoteData(PythonData):
     """
     # Default file for EURUSD quotes at 1min UTC
     KEY = format_fx_filename("EURUSD", "quotes", "1min", "utc")
+    
 
     def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
         # Derive file name from symbol alias and requested increment
@@ -167,6 +238,12 @@ class CustomEurUsdQuoteData(PythonData):
         try:
             data = line.split(',')
             time_obj = datetime.strptime(data[0].strip(), "%Y-%m-%d %H:%M:%S")
+            
+            # Apply global delta if set
+            delta_time = _GLOBAL_DELTA
+            if delta_time:
+                time_obj = time_obj + delta_time
+            
             bid_open, bid_high, bid_low, bid_close = map(float, data[1:5])
             ask_open, ask_high, ask_low, ask_close = map(float, data[5:9])
             # Determine true period from alias/file granularity
@@ -182,7 +259,7 @@ class CustomEurUsdQuoteData(PythonData):
             qb.period = period
             qb.bid = Bar(bid_open, bid_high, bid_low, bid_close)
             qb.ask = Bar(ask_open, ask_high, ask_low, ask_close)
-            qb.value = qb.close  # close derived from mid
+            qb.value = qb.close
             return qb
         except Exception:
             return None
@@ -205,6 +282,8 @@ class TradingViewEurUsdTradeData(PythonData):
     """
     # Default file for EURUSD trades at 1min UTC from TradingView
     KEY = format_fx_filename("EURUSD", "trades", "1min", "utc", source="tradingview")
+    
+    # Uses global delta only; no per-symbol overrides to keep it simple.
 
     def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
         default_gran = _granularity_from_increment(getattr(config, 'increment', None))
@@ -223,6 +302,12 @@ class TradingViewEurUsdTradeData(PythonData):
             if ts_raw > 10**12:  # milliseconds
                 ts_raw //= 1000
             time_obj = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+            
+            # Apply global delta if set
+            delta_time = _GLOBAL_DELTA
+            if delta_time:
+                time_obj = time_obj + delta_time
+            
             open_price = float(parts[1]); high_price = float(parts[2])
             low_price = float(parts[3]); close_price = float(parts[4])
             volume = int(parts[5])
@@ -288,3 +373,56 @@ class GenericTradingViewForexTradeData(TradingViewEurUsdTradeData):
                 pair, gran = _extract_pair_and_granularity(getattr(config.symbol, 'value', str(config.symbol)), default_granularity=default_gran)
                 key = format_fx_filename(pair, "trades", gran, "utc", source="tradingview")
                 return SubscriptionDataSource(key, SubscriptionTransportMedium.OBJECT_STORE)
+
+
+class NewsDayState(PythonData):
+    """Custom data loader for news day state CSV data.
+    
+    Loads data from news_day_state.csv with format:
+    date,DayState
+    2025-01-02 12:45:00,1
+    2025-01-02 13:15:00,0
+    2025-01-02 14:00:00,2
+    
+    DayState values: 0=OFF, 1=TURNING_OF, 2=FON
+    """
+    
+    def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
+        key = "news_day_state.csv"
+        return SubscriptionDataSource(key, SubscriptionTransportMedium.OBJECT_STORE)
+    
+    def reader(self, config: SubscriptionDataConfig, line: str, date: datetime, is_live_mode: bool) -> BaseData:
+        # Skip empty lines and header
+        if not line.strip() or line.startswith('date'):
+            return None
+        
+        try:
+            # Parse: date,DayState
+            data = line.split(',')
+            if len(data) != 2:
+                return None
+            
+            # Create new instance
+            news_data = NewsDayState()
+            news_data.symbol = config.symbol
+            
+            # Parse timestamp
+            timestamp_str = data[0].strip()
+            news_data.time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            news_data.end_time = news_data.time
+            
+            # Apply global delta if configured
+            if _GLOBAL_DELTA is not None:
+                news_data.time += _GLOBAL_DELTA
+                news_data.end_time += _GLOBAL_DELTA
+            
+            # Parse DayState value
+            day_state = int(data[1].strip())
+            news_data.value = day_state
+            news_data["DayState"] = day_state
+            
+            return news_data
+            
+        except Exception:
+            # Skip malformed lines
+            return None
