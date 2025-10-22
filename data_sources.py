@@ -40,6 +40,25 @@ except Exception:  # Minimal stubs
 # Set it once from your algorithm if you need to shift timestamps uniformly.
 _GLOBAL_DELTA: Optional[timedelta] = None
 
+# Module-level simulated price deltas (applied to trade prices to create bid/ask)
+# These defaults represent 1 pip for EURUSD (0.0001). They can be changed via
+# the public setter `set_simulated_price_deltas`.
+_SIMULATED_BID_DELTA: float = 0.0001
+_SIMULATED_ASK_DELTA: float = 0.0001
+
+
+def set_simulated_price_deltas(bid_delta: Optional[float] = None, ask_delta: Optional[float] = None) -> None:
+    """Set module-wide simulated bid/ask deltas used by SimulatedEurUsdQuoteData.
+
+    Pass None to leave a value unchanged. Values are floats representing
+    absolute price offsets (e.g. 0.0001 for 1 pip on EURUSD).
+    """
+    global _SIMULATED_BID_DELTA, _SIMULATED_ASK_DELTA
+    if bid_delta is not None:
+        _SIMULATED_BID_DELTA = float(bid_delta)
+    if ask_delta is not None:
+        _SIMULATED_ASK_DELTA = float(ask_delta)
+
 def _parse_delta_string(s: str) -> timedelta:
     """Parse a human-friendly delta string into timedelta.
 
@@ -331,6 +350,117 @@ class TradingViewEurUsdTradeData(PythonData):
             return None
 
 
+class SimulatedEurUsdQuoteData(PythonData):
+    """Simulated EURUSD quote data from TradingView trade data.
+    
+    Reads OHLC trade data from TradingView format and generates bid/ask quotes
+    by applying configurable deltas to the trade prices.
+    
+    CSV Format (same as TradingViewEurUsdTradeData):
+      time,open,high,low,close,Volume
+      
+    Example line:
+      1751836440,1.17777,1.17796,1.17777,1.17796,1
+      
+    Usage:
+        # Configure module-level simulated deltas (e.g. 1 pip = 0.0001)
+        set_simulated_price_deltas(bid_delta=0.0001, ask_delta=0.0001)
+        # Then add the data source (no deltas passed to constructor)
+        data_source = SimulatedEurUsdQuoteData()
+        self.add_data(data_source, "EURUSD_IMPORT", Resolution.MINUTE)
+    """
+    
+    # Default file for EURUSD trades at 1min UTC from TradingView
+    KEY = format_fx_filename("EURUSD", "trades", "1min", "utc", source="tradingview")
+    
+    def __init__(self):
+        """No per-instance deltas: reads module-level simulated deltas instead."""
+        super().__init__()
+    
+    def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
+        default_gran = _granularity_from_increment(getattr(config, 'increment', None))
+        alias = getattr(config, 'symbol', None)
+        sym_val = getattr(alias, 'value', str(alias))
+        pair, gran = _extract_pair_and_granularity(sym_val or "EURUSD", default_granularity=default_gran)
+        key = format_fx_filename(pair, "trades", gran, "utc", source="tradingview")
+        return SubscriptionDataSource(key, SubscriptionTransportMedium.OBJECT_STORE)
+    
+    def reader(self, config: SubscriptionDataConfig, line: str, date: datetime, is_live_mode: bool) -> Optional[BaseData]:
+        if _is_empty_line(line) or line.startswith("time"):
+            return None
+        try:
+            parts = line.split(',')
+            ts_raw = int(parts[0].strip())
+            if ts_raw > 10**12:  # milliseconds
+                ts_raw //= 1000
+            time_obj = datetime.fromtimestamp(ts_raw, tz=timezone.utc)
+            
+            # Apply global delta if set
+            delta_time = _GLOBAL_DELTA
+            if delta_time:
+                time_obj = time_obj + delta_time
+            
+            # Parse trade OHLC prices
+            open_price = float(parts[1])
+            high_price = float(parts[2])
+            low_price = float(parts[3])
+            close_price = float(parts[4])
+            
+            # Generate bid prices (subtract module-level bid delta)
+            bid_open = open_price - _SIMULATED_BID_DELTA
+            bid_high = high_price - _SIMULATED_BID_DELTA
+            bid_low = low_price - _SIMULATED_BID_DELTA
+            bid_close = close_price - _SIMULATED_BID_DELTA
+            
+            # Generate ask prices (add module-level ask delta)
+            ask_open = open_price + _SIMULATED_ASK_DELTA
+            ask_high = high_price + _SIMULATED_ASK_DELTA
+            ask_low = low_price + _SIMULATED_ASK_DELTA
+            ask_close = close_price + _SIMULATED_ASK_DELTA
+            
+            # Determine true period from alias/file granularity
+            default_gran = _granularity_from_increment(getattr(config, 'increment', None))
+            alias = getattr(config, 'symbol', None)
+            sym_val = getattr(alias, 'value', str(alias))
+            _pair, gran = _extract_pair_and_granularity(sym_val or "EURUSD", default_granularity=default_gran)
+            period = _granularity_to_timedelta(gran)
+            
+            # Create QuoteBar with bid/ask data
+            qb = QuoteBar()
+            qb.symbol = config.symbol
+            qb.time = time_obj
+            qb.end_time = time_obj + period
+            qb.period = period
+            qb.bid = Bar(bid_open, bid_high, bid_low, bid_close)
+            qb.ask = Bar(ask_open, ask_high, ask_low, ask_close)
+            qb.value = qb.close
+            return qb
+        except Exception:
+            return None
+
+
+class GenericSimulatedTradingViewForexQuoteData(SimulatedEurUsdQuoteData):
+    """Generic multi-symbol simulated TradingView quote data.
+
+    Derives the ObjectStore key from the subscription symbol and granularity
+    using pattern: fx-<PAIR>-trades-<gran>-utc-tradingview.csv and reuses the
+    SimulatedEurUsdQuoteData reader to produce QuoteBar objects with
+    simulated bid/ask prices.
+
+    Usage:
+        self.add_data(GenericSimulatedTradingViewForexQuoteData, "EURUSD_IMPORT", Resolution.MINUTE)
+        self.add_data(GenericSimulatedTradingViewForexQuoteData, "GBPUSD_IMPORT_5MIN", Resolution.MINUTE)
+    """
+
+    # Inherit KEY from SimulatedEurUsdQuoteData; get_source will override
+
+    def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
+        default_gran = _granularity_from_increment(getattr(config, 'increment', None))
+        pair, gran = _extract_pair_and_granularity(getattr(config.symbol, 'value', str(config.symbol)), default_granularity=default_gran)
+        key = format_fx_filename(pair, "trades", gran, "utc", source="tradingview")
+        return SubscriptionDataSource(key, SubscriptionTransportMedium.OBJECT_STORE)
+
+
 class GenericForexQuoteData(CustomEurUsdQuoteData):
         """Generic multi-symbol Forex quote (bid/ask) data loader.
 
@@ -425,4 +555,57 @@ class NewsDayState(PythonData):
             
         except Exception:
             # Skip malformed lines
+            return None
+
+
+class HolidayData(PythonData):
+    """Custom data loader for holiday calendar dates.
+
+    Expects an ObjectStore CSV named 'holidays.csv' with a single header column:
+        holiday_date
+        2025-01-09
+        2025-01-20
+
+    Each row yields a data point at 00:00:00 of the given date. The instance's
+    value is set to 1 and an additional field 'HolidayDate' is included (ISO 'YYYY-MM-DD').
+    If a global time delta is configured, it is applied ONLY to time/end_time.
+    The 'HolidayDate' field always reflects the RAW CSV date (no delta applied).
+    """
+
+    def get_source(self, config: SubscriptionDataConfig, date: datetime, is_live_mode: bool) -> SubscriptionDataSource:
+        key = "holidays.csv"
+        return SubscriptionDataSource(key, SubscriptionTransportMedium.OBJECT_STORE)
+
+    def reader(self, config: SubscriptionDataConfig, line: str, date: datetime, is_live_mode: bool) -> Optional[BaseData]:
+        # Ignore empty lines and header
+        if not line or not line.strip():
+            return None
+        if line.strip().lower().startswith("holiday_date"):
+            return None
+
+        try:
+            # Accept potential extra columns, only first one matters (the date)
+            parts = line.split(',')
+            date_str = parts[0].strip()
+            if not date_str:
+                return None
+
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            csv_date_str = dt.date().strftime("%Y-%m-%d")  # keep raw CSV date (no delta)
+
+            item = HolidayData()
+            item.symbol = config.symbol
+            item.time = dt
+            item.end_time = dt
+
+            # Apply module-wide delta if set (time fields only, NOT HolidayDate)
+            if _GLOBAL_DELTA is not None:
+                item.time += _GLOBAL_DELTA
+                item.end_time += _GLOBAL_DELTA
+
+            # Emit a simple flag value and store the date explicitly (ISO string)
+            item.value = 1
+            item["HolidayDate"] = csv_date_str
+            return item
+        except Exception:
             return None
